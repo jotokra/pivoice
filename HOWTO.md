@@ -20,6 +20,23 @@ echo "alias pivoice=~/pivoice/pivoice.py" >> ~/.zshrc
 ```
 
 **First run:** macOS prompts *"Terminal wants to access the microphone"* — click **Allow**.
+
+### Post-onboarding gate (apple-pi)
+
+pivoice refuses to start while the apple-pi config is still onboarding
+scaffolding (`settings.json` has `_applepi_seed: true`) — i.e. until the
+Phase 3 self-assessment that tunes the config to your model has run. This is
+intentional and **cannot be skipped**. If you see:
+
+```
+✗ apple-pi config is still onboarding scaffolding
+Run the self-assessment, then relaunch pivoice:
+    pi -p "/skill:self-assess"
+```
+
+run that command once (it clears the marker), then relaunch pivoice. The gate
+fails open on a missing/unreadable settings file, so non-apple-pi installs are
+never blocked.
 Re-grant later via *System Settings → Privacy & Security → Microphone* if you denied it.
 
 ## Keys

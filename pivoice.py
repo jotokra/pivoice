@@ -155,6 +155,46 @@ def _fmt_args(args) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# Post-onboarding hardening: refuse to run against an untuned apple-pi config.
+# --------------------------------------------------------------------------- #
+
+def applepi_settings_path() -> Path:
+    """Resolve pi's global settings.json (the apple-pi agent dir)."""
+    return Path(os.path.expanduser("~/.pi/agent/settings.json"))
+
+
+def require_applepi_tuned():
+    """Hard gate: if settings.json still carries the onboarding seed marker,
+    the config is untuned scaffolding (P3 self-assessment never ran). Refuse to
+    start the voice session until it has been run.
+
+    No bypass flag, no env override — the post-onboarding self-assessment is
+    non-optional from this entry point. Resolution is always reachable: run the
+    self-assessment (which clears the marker), then relaunch. Fails OPEN on a
+    missing/unreadable/non-apple-pi settings file (we only block on the explicit
+    `_applepi_seed: true` marker, so a genuinely tuned or non-apple-pi install
+    is never bricked).
+    """
+    path = applepi_settings_path()
+    try:
+        d = json.loads(path.read_text())
+    except Exception:
+        return  # no settings / not apple-pi / unreadable -> don't block
+    if d.get("_applepi_seed") is True:
+        sys.stdout.write("\n")
+        sys.stdout.write(c("red", "✗ apple-pi config is still onboarding scaffolding\n"))
+        sys.stdout.write(c("grey", "  (settings.json has _applepi_seed=true; the Phase 3\n"))
+        sys.stdout.write(c("grey", "   self-assessment that tunes the config to your model\n"))
+        sys.stdout.write(c("grey", "   never ran.)\n\n"))
+        sys.stdout.write(c("yellow", "Run the self-assessment, then relaunch pivoice:\n"))
+        sys.stdout.write(c("bold", "    pi -p \"/skill:self-assess\"\n"))
+        sys.stdout.write(c("grey", "  (or: run `pi`, then type  /skill:self-assess )\n\n"))
+        sys.stdout.write(c("grey", "This gate is intentional and cannot be skipped — the\n"))
+        sys.stdout.write(c("grey", "post-onboarding tune is required for correct behavior.\n"))
+        sys.exit(2)
+
+
+# --------------------------------------------------------------------------- #
 # TUI — alternate-screen, full-frame redraw, single writer
 # --------------------------------------------------------------------------- #
 
@@ -783,6 +823,8 @@ speaker: Speaker   # referenced by PiBridge._feed_tts; set in main()
 
 def main():
     global speaker
+
+    require_applepi_tuned()
 
     model = Path(os.environ.get("PIVOICE_MODEL", DEFAULT_MODEL)).expanduser()
     if not model.exists():
