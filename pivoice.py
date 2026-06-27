@@ -74,6 +74,10 @@ STYLE_FG = {
     "user": "\033[1m\033[38;5;46m",    # bold green
     "pi":   "\033[38;5;255m",          # near-white
     "pi_pre": "\033[38;5;39m",         # cyan marker
+    "thinking": "\033[3m\033[38;5;245m", # italic grey (reasoning)
+    "tool":  "\033[38;5;110m",         # soft blue (tool calls)
+    "tool_ok": "\033[38;5;108m",       # muted green (tool success)
+    "tool_err": "\033[38;5;174m",      # muted red (tool error)
     "sys":  "\033[38;5;244m",          # grey
     "warn": "\033[38;5;214m",          # amber
     "err":  "\033[38;5;203m",          # soft red
@@ -130,6 +134,26 @@ def wrap_plain(text: str, width: int) -> list:
     return out or [""]
 
 
+def _fmt_args(args) -> str:
+    """Compact one-line rendering of a tool's args dict for the TUI."""
+    if not args:
+        return ""
+    try:
+        parts = []
+        for k, v in args.items():
+            if isinstance(v, str):
+                s = v.replace("\n", "\\n")
+                if len(s) > 60:
+                    s = s[:57] + "…"
+                parts.append(f"{k}={s!r}" if (" " in s or not s) else f"{k}={s}")
+            else:
+                parts.append(f"{k}={v}")
+        line = "  ".join(parts)
+        return line[:120] + ("…" if len(line) > 120 else "")
+    except Exception:
+        return repr(args)[:120]
+
+
 # --------------------------------------------------------------------------- #
 # TUI — alternate-screen, full-frame redraw, single writer
 # --------------------------------------------------------------------------- #
@@ -164,6 +188,7 @@ class TUI:
         self.detail = ""
         self.entries: list = []     # (style, plain_text)
         self._stream = ""           # in-progress assistant text
+        self._stream_style = "pi"
         self._lock = threading.RLock()
         self._stop = threading.Event()
         self._thread = None
@@ -212,15 +237,34 @@ class TUI:
                 del self.entries[: len(self.entries) - self.MAX_ENTRIES]
             self._stream = ""
 
-    def stream(self, delta: str):
+    def stream(self, delta: str, style: str = "pi"):
+        # Only one in-flight stream at a time; commit before switching styles.
         with self._lock:
+            if self._stream and self._stream_style != style:
+                self._commit_locked()
+            self._stream_style = style
             self._stream += delta
+
+    def _commit_locked(self):
+        if self._stream.strip():
+            self.entries.append((self._stream_style, self._stream.rstrip()))
+            if len(self.entries) > self.MAX_ENTRIES:
+                del self.entries[: len(self.entries) - self.MAX_ENTRIES]
+        self._stream = ""
 
     def commit_stream(self):
         with self._lock:
-            if self._stream.strip():
-                self.entries.append(("pi", self._stream.rstrip()))
-            self._stream = ""
+            self._commit_locked()
+
+    def tool_line(self, text: str, style: str = "tool"):
+        text = text.rstrip("\n")
+        if not text:
+            return
+        with self._lock:
+            self._commit_locked()
+            self.entries.append((style, text))
+            if len(self.entries) > self.MAX_ENTRIES:
+                del self.entries[: len(self.entries) - self.MAX_ENTRIES]
 
     def clear_log(self):
         with self._lock:
@@ -593,10 +637,13 @@ class PiBridge:
     SENTENCE_END_RE = Speaker.SENTENCE_END
 
     def __init__(self, cwd: str, extra_args=None, on_text=None,
-                 on_state=None, on_turn_end=None, on_event=None):
+                 on_thinking=None, on_tool=None, on_state=None,
+                 on_turn_end=None, on_event=None):
         self.cwd = cwd
         self.extra_args = list(extra_args or [])
         self.on_text = on_text
+        self.on_thinking = on_thinking
+        self.on_tool = on_tool
         self.on_state = on_state
         self.on_turn_end = on_turn_end
         self.on_event = on_event
@@ -648,7 +695,8 @@ class PiBridge:
                 self.on_event(("agent_end", msg))
         elif mtype == "message_update":
             ev = msg.get("assistantMessageEvent", {})
-            if ev.get("type") == "text_delta":
+            etype = ev.get("type")
+            if etype == "text_delta":
                 delta = ev.get("delta", "")
                 if delta:
                     if self.on_text:
@@ -656,6 +704,20 @@ class PiBridge:
                     self._feed_tts(delta)
                     if self.on_state:
                         self.on_state("speaking")
+            elif etype == "thinking_delta":
+                delta = ev.get("delta", "")
+                if delta and self.on_thinking:
+                    self.on_thinking(delta)
+        elif mtype == "tool_execution_start":
+            name = msg.get("toolName", "tool")
+            args = msg.get("args", {})
+            if self.on_tool:
+                self.on_tool("start", name, args, False)
+        elif mtype == "tool_execution_end":
+            name = msg.get("toolName", "tool")
+            is_error = bool(msg.get("isError"))
+            if self.on_tool:
+                self.on_tool("end", name, {}, is_error)
         elif mtype == "extension_error":
             err = msg.get("error", "extension error")
             if self.on_event:
@@ -743,10 +805,20 @@ def main():
     tui = TUI(info)
 
     def on_text(delta):
-        tui.stream(delta)
+        tui.stream(delta, "pi")
+
+    def on_thinking(delta):
+        tui.stream(delta, "thinking")
+
+    def on_tool(phase, name, args, is_error):
+        if phase == "start":
+            tui.tool_line(f"↳ {name}  {_fmt_args(args)}", "tool")
+        else:
+            tui.tool_line(("  ↳ ✓" if not is_error else "  ↳ ✗ failed"),
+                          "tool_ok" if not is_error else "tool_err")
 
     def on_state(state):
-        detail = {"thinking": "waiting on model…",
+        detail = {"thinking": "working — reasoning or running tools…",
                   "speaking": "streaming reply…",
                   "recording": "listening — tap SPACE to send",
                   "transcribing": "whisper.cpp decoding…"}.get(state, "")
@@ -764,6 +836,7 @@ def main():
     sys.stdout.write(c("grey", f"starting pi (cwd={cwd}) …\n"))
     sys.stdout.flush()
     bridge = PiBridge(cwd=cwd, extra_args=extra_args, on_text=on_text,
+                      on_thinking=on_thinking, on_tool=on_tool,
                       on_state=on_state, on_turn_end=on_turn_end,
                       on_event=on_event)
     try:
@@ -785,7 +858,7 @@ def main():
     # ---- enter the TUI ---------------------------------------------------- #
     with RawTerm():
         tui.setup()
-        tui.add("ready · tap SPACE to talk", "ok")
+        tui.add("ready · tap SPACE to talk · talk to the real pi agent (full tools + skills)", "ok")
 
         # ensure teardown even on signals
         def _on_sig(signum, frame):
