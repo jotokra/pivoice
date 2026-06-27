@@ -410,6 +410,8 @@ class TUI:
         # colorize keywords inside the title row by post-processing is messy;
         # keep title uniform white for a clean look.
         meta_text = f"  mic {info['mic']}   stt {info['stt']}   tts {info['tts']}"
+        if info.get("model"):
+            meta_text += f"   model {info['model']}"
         meta = self._brow(meta_text, w, border=border, textcolor=244)
         return (f"\033[1;1H{self._pad(w, top)}"
                 f"\033[2;1H{self._pad(w, title)}"
@@ -434,7 +436,7 @@ class TUI:
         return self._pad(w, content)
 
     def _hint_row(self, w: int) -> str:
-        hint = "SPACE talk · a abort · n new · c clear · q quit"
+        hint = "SPACE talk · m model · a abort · n new · c clear · q quit"
         return self._pad(w, color256(238, hint))
 
     def _eq(self, state: str, width: int) -> str:
@@ -718,6 +720,7 @@ class PiBridge:
         self.streaming = False
         self._stop = threading.Event()
         self.tts_buffer = ""
+        self._pending = {}            # id -> {event, result} for synchronous _request()
 
     def start(self):
         # Resume an existing session if PIVOICE_SESSION is set (voice-mode handoff
@@ -752,6 +755,13 @@ class PiBridge:
     def _dispatch(self, msg: dict):
         mtype = msg.get("type")
         if mtype == "response":
+            # Fulfil any synchronous _request waiting on this id.
+            rid = msg.get("id")
+            slot = self._pending.get(rid) if rid else None
+            if slot is not None:
+                slot["result"] = msg
+                slot["event"].set()
+                return
             if self.on_event:
                 self.on_event(("response", msg))
         elif mtype == "agent_start":
@@ -816,6 +826,40 @@ class PiBridge:
         obj.setdefault("id", f"req-{self._req_id}")
         self.proc.stdin.write(json.dumps(obj) + "\n")
         self.proc.stdin.flush()
+
+    def _request(self, obj: dict, timeout: float = 5.0):
+        """Synchronous request/response for UI actions (e.g. cycle_model).
+
+        _send is fire-and-forget; this one waits for the matching response by
+        id. _dispatch fulfils the slot when the response arrives."""
+        self._req_id += 1
+        rid = f"req-{self._req_id}"
+        obj["id"] = rid
+        slot = {"event": threading.Event(), "result": None}
+        self._pending[rid] = slot
+        try:
+            self.proc.stdin.write(json.dumps(obj) + "\n")
+            self.proc.stdin.flush()
+            slot["event"].wait(timeout=timeout)
+            return slot["result"]
+        finally:
+            self._pending.pop(rid, None)
+
+    def cycle_model(self):
+        """Cycle to the next configured model. Returns the new model label or None."""
+        if self.streaming:
+            return None  # don't cycle mid-turn
+        resp = self._request({"type": "cycle_model"})
+        if not resp or not resp.get("success"):
+            return None
+        data = resp.get("data") or {}
+        m = data.get("model") or {}
+        if not m:
+            return None
+        label = f"{m.get('provider','?')}/{m.get('id','?')}"
+        if data.get("thinkingLevel"):
+            label += f" @{data['thinkingLevel']}"
+        return label
 
     def get_state(self):
         self._send({"type": "get_state"})
@@ -928,6 +972,15 @@ def main():
             sys.stdout.write(c("grey", log[-800:] + "\n"))
         sys.exit(1)
 
+    # Seed the active model in the header (for display + the m-key context).
+    try:
+        st = bridge._request({"type": "get_state"}, timeout=4)
+        m = ((st or {}).get("data") or {}).get("model") or {}
+        if m.get("id"):
+            info["model"] = f"{m.get('provider','?')}/{m['id']}"
+    except Exception:
+        pass
+
     recorder = Recorder(mic_index)
     atexit.register(recorder.cleanup)   # never orphan ffmpeg, even on a hard crash
     wav_path = HERE / "last.wav"
@@ -972,6 +1025,17 @@ def main():
                     speaker.stop()
                     bridge.new_session()
                     tui.add("new session", "ok")
+                    continue
+
+                if key == "m":
+                    # Cycle pi's configured models — escape hatch when the current
+                    # model is being timid about tool use. Returns the new label.
+                    label = bridge.cycle_model()
+                    if label:
+                        tui.info = {**tui.info, "model": label}
+                        tui.add(f"model → {label}", "ok")
+                    else:
+                        tui.add("model cycle: only one model configured (or still streaming)", "sys")
                     continue
 
                 if key in (" ", "r"):
