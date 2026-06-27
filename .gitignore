@@ -1,0 +1,19 @@
+# Local model weights (download on demand — too big for git)
+models/
+
+# Per-run artifacts
+last.wav
+last.txt
+pi.log
+*.wav
+*.txt
+!HOWTO.md
+
+# Python
+__pycache__/
+*.pyc
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
