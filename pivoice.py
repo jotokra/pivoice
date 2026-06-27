@@ -20,6 +20,9 @@ Config via env:
   PIVOICE_NO_SPEAK  "1" to disable spoken replies (text still shown)
   PIVOICE_PI_CWD    working directory for pi (default: $PWD)
   PIVOICE_PI_ARGS   extra args to `pi --mode rpc ...`
+  PIVOICE_SESSION   path to a pi session JSONL to RESUME (voice-mode handoff
+                    from the pi TUI; appended turns go to that same file).
+                    When unset, pivoice starts a fresh "voice" session.
 """
 from __future__ import annotations
 import atexit
@@ -694,7 +697,15 @@ class PiBridge:
         self.tts_buffer = ""
 
     def start(self):
-        cmd = ["pi", "--mode", "rpc", "-n", "voice"] + self.extra_args
+        # Resume an existing session if PIVOICE_SESSION is set (voice-mode handoff
+        # from the pi TUI: same JSONL file, appended turns). Otherwise start fresh.
+        session = os.environ.get("PIVOICE_SESSION")
+        cmd = ["pi", "--mode", "rpc"]
+        if session:
+            cmd += ["--session", session]
+        else:
+            cmd += ["-n", "voice"]
+        cmd += self.extra_args
         self.logfile = open(HERE / "pi.log", "w")
         self.proc = subprocess.Popen(
             cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -991,6 +1002,10 @@ def main():
             tui.teardown()
 
     sys.stdout.write(c("grey", "shutting down…\n"))
+    if os.environ.get("PIVOICE_SESSION"):
+        sys.stdout.write(c("cyan", "voice mode ended — resume your session in the pi TUI:\n"))
+        sys.stdout.write(c("bold", f"  pi -c\n"))
+        sys.stdout.write(c("grey", "  (voice turns are appended to the same session file.)\n"))
     speaker.shutdown()
     bridge.shutdown()
 
