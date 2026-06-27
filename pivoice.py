@@ -5,10 +5,10 @@ pivoice — voice front-end for the pi coding agent.
   speak -> transcribe (whisper.cpp) -> prompt pi (RPC) -> stream + speak reply (say)
 
 Controls (shown on launch):
-  SPACE / r   push to talk (press once to start, again to stop & send)
+  SPACE / r   tap to start recording, tap again to stop & send
   a           abort the current pi turn (and stop any speech)
-  n           new session (/new)
-  c           clear screen
+  n           new session
+  c           clear the conversation
   q / Ctrl-C  quit
 
 No cloud, no API key for speech. pi uses its own configured provider/auth.
@@ -22,6 +22,7 @@ Config via env:
   PIVOICE_PI_ARGS   extra args to `pi --mode rpc ...`
 """
 from __future__ import annotations
+import atexit
 import json
 import math
 import os
@@ -41,26 +42,22 @@ from queue import Queue, Empty
 HERE = Path(__file__).resolve().parent
 DEFAULT_MODEL = HERE / "models" / "ggml-small.en.bin"
 
-# --------------------------------------------------------------------------- #
-# Terminal helpers
-# --------------------------------------------------------------------------- #
+RESET = "\033[0m"
+BOLD = "\033[1m"
+DIM = "\033[2m"
 
+# Named ANSI helpers (kept for convenience).
 ANSI = {
-    "reset": "\033[0m", "bold": "\033[1m", "dim": "\033[2m",
+    "reset": RESET, "bold": BOLD, "dim": DIM,
     "red": "\033[31m", "green": "\033[32m", "yellow": "\033[33m",
     "blue": "\033[34m", "magenta": "\033[35m", "cyan": "\033[36m",
     "grey": "\033[90m",
-    "bg_cyan": "\033[46m", "bg_magenta": "\033[45m", "bg_grey": "\033[100m",
 }
 
-# 256-color codes for the equalizer gradient (height 0..8): dim → cyan → magenta.
-BAR_COLORS = [238, 244, 51, 45, 39, 99, 135, 165, 201]
-REC_COLOR = 196  # bright red for recording pulse
-
-# Braille spinner frames for the "thinking" state.
+# 256-color gradient for the equalizer (height 0..8): dim → cyan → magenta.
+BAR_COLORS = [236, 238, 51, 45, 39, 99, 135, 165, 201]
+REC_COLOR = 196
 SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
-
-# Block characters for equalizer bar heights 0..8.
 BLOCKS = " ▁▂▃▄▅▆▇█"
 
 
@@ -69,12 +66,24 @@ def c(name: str, text: str) -> str:
 
 
 def color256(code: int, text: str) -> str:
-    return f"\033[38;5;{code}m{text}\033[0m"
+    return f"\033[38;5;{code}m{text}{RESET}"
 
 
-def bold_color256(code: int, text: str) -> str:
-    return f"\033[1m\033[38;5;{code}m{text}\033[0m"
+# Per-style foreground prefixes for log lines.
+STYLE_FG = {
+    "user": "\033[1m\033[38;5;46m",    # bold green
+    "pi":   "\033[38;5;255m",          # near-white
+    "pi_pre": "\033[38;5;39m",         # cyan marker
+    "sys":  "\033[38;5;244m",          # grey
+    "warn": "\033[38;5;214m",          # amber
+    "err":  "\033[38;5;203m",          # soft red
+    "ok":   "\033[38;5;42m",           # green
+}
 
+
+# --------------------------------------------------------------------------- #
+# Raw terminal input
+# --------------------------------------------------------------------------- #
 
 class RawTerm:
     """Switch the terminal to raw mode for single-keypress input."""
@@ -95,6 +104,274 @@ class RawTerm:
         if ch == "\r":
             ch = "\n"
         return ch
+
+
+def wrap_plain(text: str, width: int) -> list:
+    """Word-wrap plain (no-ANSI) text to `width` columns. Honors newlines."""
+    width = max(10, width)
+    out = []
+    for para in text.split("\n"):
+        if not para:
+            out.append("")
+            continue
+        cur = ""
+        for word in para.split(" "):
+            if not cur:
+                cur = word
+            elif len(cur) + 1 + len(word) <= width:
+                cur += " " + word
+            else:
+                out.append(cur)
+                cur = word
+            while len(cur) > width:           # hard-break very long tokens
+                out.append(cur[:width])
+                cur = cur[width:]
+        out.append(cur)
+    return out or [""]
+
+
+# --------------------------------------------------------------------------- #
+# TUI — alternate-screen, full-frame redraw, single writer
+# --------------------------------------------------------------------------- #
+
+class TUI:
+    """A self-contained futuristic TUI.
+
+    Architecture (race-free): everything funnels into an in-memory log; a single
+    animation thread paints the WHOLE screen from scratch each frame using
+    absolute cursor addressing. There are no streaming writes to the terminal
+    and no scroll regions, so conversation text and the status panel can never
+    garble each other.
+    """
+
+    HEADER_ROWS = 4               # top border, title, meta, bottom border
+    PANEL_ROWS = 3                 # separator + status + hints
+    FPS = 24
+    MAX_ENTRIES = 400
+
+    STATE_META = {
+        # state: (label, icon, accent_color, amp, speed, jitter, floor, red)
+        "idle":         ("IDLE",  "◇", 51,  0.10, 1.2, 0, 0, False),
+        "recording":    ("REC",   "●", 196, 0.85, 6.0, 2, 2, True),
+        "transcribing": ("STT",   "◐", 214, 0.35, 3.5, 1, 1, False),
+        "thinking":     ("THINK", "◆", 99,  0.25, 2.0, 0, 1, False),
+        "speaking":     ("SPEAK", "◆", 201, 0.95, 5.5, 2, 1, False),
+    }
+
+    def __init__(self, info: dict):
+        self.info = info
+        self.state = "idle"
+        self.detail = ""
+        self.entries: list = []     # (style, plain_text)
+        self._stream = ""           # in-progress assistant text
+        self._lock = threading.RLock()
+        self._stop = threading.Event()
+        self._thread = None
+        self._t0 = time.time()
+        self._spin = 0
+        self._cols, self._rows = 80, 24
+        self._alt = False
+        self._out = sys.stdout      # the real terminal stream; never reassigned
+
+    # ---- lifecycle -------------------------------------------------------- #
+    def setup(self):
+        self._size()
+        # Enter alternate screen, hide cursor, clear.
+        self._emit("\033[?1049h\033[?25l\033[H\033[2J")
+        self._alt = True
+        self.start()
+        atexit.register(self.teardown)
+
+    def teardown(self):
+        self.stop()
+        if self._alt:
+            self._emit("\033[?25h\033[?1049l")
+            self._alt = False
+
+    def start(self):
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        t, self._thread = self._thread, None
+        if t and t.is_alive():
+            t.join(timeout=1.0)
+
+    # ---- content API (thread-safe, no terminal writes) -------------------- #
+    def add(self, text: str, style: str = "sys"):
+        text = text.rstrip("\n")
+        if not text:
+            return
+        with self._lock:
+            self.entries.append((style, text))
+            if len(self.entries) > self.MAX_ENTRIES:
+                del self.entries[: len(self.entries) - self.MAX_ENTRIES]
+            self._stream = ""
+
+    def stream(self, delta: str):
+        with self._lock:
+            self._stream += delta
+
+    def commit_stream(self):
+        with self._lock:
+            if self._stream.strip():
+                self.entries.append(("pi", self._stream.rstrip()))
+            self._stream = ""
+
+    def clear_log(self):
+        with self._lock:
+            self.entries = []
+            self._stream = ""
+
+    def set_state(self, state: str, detail: str = ""):
+        with self._lock:
+            self.state = state
+            if detail is not None:
+                self.detail = detail
+
+    # ---- rendering -------------------------------------------------------- #
+    def _size(self):
+        try:
+            sz = shutil.get_terminal_size((80, 24))
+            self._cols = max(50, sz.columns)
+            self._rows = max(18, sz.lines)
+        except Exception:
+            pass
+
+    def _emit(self, s: str):
+        self._out.write(s)
+        self._out.flush()
+
+    def _loop(self):
+        period = 1.0 / self.FPS
+        while not self._stop.is_set():
+            try:
+                self._frame()
+            except Exception:
+                pass
+            time.sleep(period)
+
+    def _frame(self):
+        self._size()
+        w, h = self._cols, self._rows
+        self._spin = (self._spin + 1) % len(SPINNER)
+        body_h = max(1, h - self.HEADER_ROWS - self.PANEL_ROWS)
+        with self._lock:
+            entries = list(self.entries)
+            stream = self._stream
+            state = self.state
+            detail = self.detail
+            info = self.info
+
+        lines = []  # (style, plain)
+        for style, text in entries:
+            for ln in wrap_plain(text, w):
+                lines.append((style, ln))
+        if stream:
+            for ln in wrap_plain(stream, w):
+                lines.append(("pi", ln))
+        visible = lines[-body_h:]
+
+        frame = []
+        # Header (3 rows)
+        frame.append(self._header(w, info))
+        # Body
+        for i in range(body_h):
+            row = self._pad(w, "")
+            if i < len(visible):
+                style, ln = visible[i]
+                row = self._pad(w, STYLE_FG.get(style, "") + ln)
+            frame.append(f"\033[{self.HEADER_ROWS + 1 + i};1H" + row)
+        # Panel
+        frame.append(f"\033[{h - 2};1H" + self._separator(w))
+        frame.append(f"\033[{h - 1};1H" + self._status_row(w, state, detail))
+        frame.append(f"\033[{h};1H" + self._hint_row(w))
+        self._emit("".join(frame))
+
+    @staticmethod
+    def _pad(w: int, content: str) -> str:
+        """Return `content` truncated/padded to exactly `w` visible columns.
+
+        ANSI escape bytes are zero-width; we measure visible length by
+        stripping them. Trailing pad uses spaces (invisible under any color).
+        """
+        visible = re.sub(r"\033\[[0-9;]*m", "", content)
+        if len(visible) > w:
+            # Truncate the visible portion; simplest: cut the whole string.
+            content = content[: max(0, len(content) - (len(visible) - w))]
+            visible = visible[:w]
+        pad = " " * (w - len(visible))
+        return content + pad + RESET
+
+    def _brow(self, inner_text: str, w: int, border: int = 51,
+              textcolor: int = 255) -> str:
+        inner = max(10, w - 2)
+        inner_text = inner_text[:inner].ljust(inner)
+        return (color256(border, "│") + color256(textcolor, inner_text)
+                + color256(border, "│"))
+
+    def _header(self, w: int, info: dict) -> str:
+        border = 51
+        top = color256(border, "╭" + "─" * max(10, w - 2) + "╮")
+        bot = color256(border, "╰" + "─" * max(10, w - 2) + "╯")
+        title = self._brow("  " + "pivoice" + "  ·  " + "voice ⇄ pi", w,
+                           border=border, textcolor=255)
+        # colorize keywords inside the title row by post-processing is messy;
+        # keep title uniform white for a clean look.
+        meta_text = f"  mic {info['mic']}   stt {info['stt']}   tts {info['tts']}"
+        meta = self._brow(meta_text, w, border=border, textcolor=244)
+        return (f"\033[1;1H{self._pad(w, top)}"
+                f"\033[2;1H{self._pad(w, title)}"
+                f"\033[3;1H{self._pad(w, meta)}"
+                f"\033[4;1H{self._pad(w, bot)}")
+
+    def _separator(self, w: int) -> str:
+        return self._pad(w, color256(236, "─" * w))
+
+    def _status_row(self, w: int, state: str, detail: str) -> str:
+        label, icon, accent, *_ = self.STATE_META.get(state, self.STATE_META["idle"])
+        spin = SPINNER[self._spin]
+        left = f"{color256(accent, icon)} {color256(accent, label)}"
+        if state == "thinking":
+            left += " " + color256(accent, spin)
+        detail_s = color256(244, detail) if detail else ""
+        left_vis = len(icon) + 1 + len(label) + (2 if state == "thinking" else 0)
+        right_vis = len(detail) + (2 if detail else 0)
+        bar_w = max(8, w - left_vis - right_vis - 3)
+        bars = self._eq(state, bar_w)
+        content = f"{left}  {bars}" + (f"  {detail_s}" if detail else "")
+        return self._pad(w, content)
+
+    def _hint_row(self, w: int) -> str:
+        hint = "SPACE talk · a abort · n new · c clear · q quit"
+        return self._pad(w, color256(238, hint))
+
+    def _eq(self, state: str, width: int) -> str:
+        _, _, accent, amp, speed, jitter, floor, red = self.STATE_META.get(
+            state, self.STATE_META["idle"])
+        t = time.time() - self._t0
+        parts = []
+        for i in range(width):
+            phase = i * 0.42
+            if state == "idle":
+                h = 1 if (i + int(t * 2)) % 9 == 0 else 0
+            elif state == "recording":
+                pulse = 0.5 + 0.5 * math.sin(t * speed + phase)
+                h = floor + int(round(pulse * (8 - floor) * amp))
+            else:
+                wave = 0.5 + 0.5 * math.sin(t * speed + phase)
+                v = wave * (0.65 + 0.35 * math.sin(t * speed * 1.7 + i * 0.6))
+                if jitter:
+                    v += random.uniform(-0.12, 0.12) * jitter
+                h = floor + int(round(v * (8 - floor) * amp))
+            h = max(0, min(8, h))
+            code = REC_COLOR if red else BAR_COLORS[h]
+            parts.append(color256(code, BLOCKS[h]))
+        return "".join(parts)
 
 
 # --------------------------------------------------------------------------- #
@@ -146,9 +423,9 @@ class Recorder:
     """Record mono 16kHz PCM via ffmpeg's avfoundation input.
 
     ffmpeg writes the WAV header on graceful close, so we send SIGINT to stop
-    and then verify the output is non-trivial. avfoundation open failures (device
-    busy / no permission / wrong index) make ffmpeg exit immediately, so we
-    sanity-check the process right after launch.
+    and then verify the output is non-trivial. avfoundation open failures
+    (device busy / no permission / wrong index) make ffmpeg exit immediately,
+    so we sanity-check the process right after launch.
     """
 
     def __init__(self, mic_index: str):
@@ -168,8 +445,6 @@ class Recorder:
              str(path)],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
         )
-        # Give avfoundation a moment to open the device; if it died here,
-        # capture stderr so we can report the real reason.
         time.sleep(0.25)
         if self.proc.poll() is not None:
             try:
@@ -184,7 +459,6 @@ class Recorder:
         self.proc = None
         if proc is None:
             raise RecorderError(f"no active recording; last: {self.stderr or 'n/a'}")
-        # SIGINT makes ffmpeg finalize and close the WAV header cleanly.
         try:
             proc.send_signal(signal.SIGINT)
         except Exception:
@@ -210,10 +484,9 @@ class Recorder:
 
 def _clean_transcript(text: str) -> str:
     """Strip whisper.cpp artifacts and special tokens."""
-    import re as _re
-    text = _re.sub(r"\[[A-Z_ ]+\]", " ", text)              # [BLANK_AUDIO], [MUSIC]
-    text = _re.sub(r"\([a-z_ ]+\)", " ", text, flags=_re.IGNORECASE)  # (blank_audio)
-    text = _re.sub(r"^\s*>+\s*", "", text)                  # leading >>
+    text = re.sub(r"\[[A-Z_ ]+\]", " ", text)                        # [BLANK_AUDIO]
+    text = re.sub(r"\([a-z_ ]+\)", " ", text, flags=re.IGNORECASE)   # (blank_audio)
+    text = re.sub(r"^\s*>+\s*", "", text)                            # leading >>
     return " ".join(text.split()).strip()
 
 
@@ -228,7 +501,6 @@ def transcribe(model: Path, wav: Path) -> str:
         capture_output=True, text=True,
     )
     if proc.returncode != 0:
-        # Filter the Metal-init chatter; keep only real error lines.
         raw = (proc.stderr or proc.stdout or "")
         errors = [ln.strip() for ln in raw.splitlines()
                   if ln.strip().lower().startswith(("error", "failed", "fatal"))]
@@ -246,13 +518,13 @@ def transcribe(model: Path, wav: Path) -> str:
 # --------------------------------------------------------------------------- #
 
 class Speaker:
-    """Speak text with `say`, sentence-by-sentce, on a worker thread."""
+    """Speak text with `say`, sentence-by-sentence, on a worker thread."""
 
     SENTENCE_END = re.compile(r"(?<=[.!?])\s+|\n+")
 
-    def __init__(self, voice: str | None):
+    def __init__(self, voice):
         self.voice = voice
-        self.queue: Queue[str | None] = Queue()
+        self.queue: Queue = Queue()
         self.proc = None
         self._lock = threading.Lock()
         self._running = True
@@ -291,7 +563,6 @@ class Speaker:
                 self.queue.put(chunk.strip())
 
     def stop(self):
-        """Stop current speech and clear the queue."""
         while True:
             try:
                 self.queue.get_nowait()
@@ -315,30 +586,34 @@ class Speaker:
 # --------------------------------------------------------------------------- #
 
 class PiBridge:
-    """Persistent `pi --mode rpc` subprocess. JSONL in/out."""
+    """Persistent `pi --mode rpc` subprocess. JSONL in/out. Pure-callback:
+    never writes to the terminal itself — routes all output through callbacks.
+    """
 
-    def __init__(self, on_text, on_event, cwd: str, extra_args=None):
-        self.on_text = on_text
-        self.on_event = on_event
+    SENTENCE_END_RE = Speaker.SENTENCE_END
+
+    def __init__(self, cwd: str, extra_args=None, on_text=None,
+                 on_state=None, on_turn_end=None, on_event=None):
         self.cwd = cwd
         self.extra_args = list(extra_args or [])
+        self.on_text = on_text
+        self.on_state = on_state
+        self.on_turn_end = on_turn_end
+        self.on_event = on_event
         self.proc = None
         self._req_id = 0
         self.streaming = False
         self._stop = threading.Event()
         self.tts_buffer = ""
 
-    def start(self) -> str:
+    def start(self):
         cmd = ["pi", "--mode", "rpc", "-n", "voice"] + self.extra_args
         self.logfile = open(HERE / "pi.log", "w")
         self.proc = subprocess.Popen(
             cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=self.logfile, text=True, bufsize=1,
-            cwd=self.cwd,
+            stderr=self.logfile, text=True, bufsize=1, cwd=self.cwd,
         )
-        t = threading.Thread(target=self._reader, daemon=True)
-        t.start()
-        return ""
+        threading.Thread(target=self._reader, daemon=True).start()
 
     def _reader(self):
         for line in self.proc.stdout:
@@ -356,32 +631,36 @@ class PiBridge:
     def _dispatch(self, msg: dict):
         mtype = msg.get("type")
         if mtype == "response":
-            self.on_event(("response", msg))
+            if self.on_event:
+                self.on_event(("response", msg))
         elif mtype == "agent_start":
             self.streaming = True
+            if self.on_state:
+                self.on_state("thinking")
         elif mtype == "agent_end":
             self.streaming = False
             self._flush_tts()
-            sys.stdout.write("\n")
-            sys.stdout.flush()
-            self.on_event(("agent_end", msg))
+            if self.on_turn_end:
+                self.on_turn_end()
+            if self.on_state:
+                self.on_state("idle")
+            if self.on_event:
+                self.on_event(("agent_end", msg))
         elif mtype == "message_update":
             ev = msg.get("assistantMessageEvent", {})
             if ev.get("type") == "text_delta":
                 delta = ev.get("delta", "")
                 if delta:
-                    self.on_text(delta)
+                    if self.on_text:
+                        self.on_text(delta)
                     self._feed_tts(delta)
+                    if self.on_state:
+                        self.on_state("speaking")
         elif mtype == "extension_error":
             err = msg.get("error", "extension error")
-            self.on_text(c("red", f"\n[pi extension error] {err}\n"))
-        else:
-            # tool activity, compaction, retry, etc.
-            if mtype in ("tool_execution_start", "compaction_start",
-                         "auto_retry_start"):
-                self.on_event((mtype, msg))
+            if self.on_event:
+                self.on_event(("extension_error", err))
 
-    # --- streaming TTS plumbing -------------------------------------------- #
     def _feed_tts(self, delta: str):
         self.tts_buffer += delta
         parts = self.SENTENCE_END_RE.split(self.tts_buffer)
@@ -391,24 +670,19 @@ class PiBridge:
                     speaker.speak(complete)
             self.tts_buffer = parts[-1]
 
-    SENTENCE_END_RE = Speaker.SENTENCE_END
-
     def _flush_tts(self):
         if self.tts_buffer.strip():
             speaker.speak(self.tts_buffer)
         self.tts_buffer = ""
 
-    # --- commands ---------------------------------------------------------- #
     def _send(self, obj: dict):
         self._req_id += 1
         obj.setdefault("id", f"req-{self._req_id}")
-        line = json.dumps(obj) + "\n"
-        self.proc.stdin.write(line)
+        self.proc.stdin.write(json.dumps(obj) + "\n")
         self.proc.stdin.flush()
 
-    def get_state(self) -> str:
+    def get_state(self):
         self._send({"type": "get_state"})
-        return ""
 
     def prompt(self, message: str):
         body = {"type": "prompt", "message": message}
@@ -442,32 +716,16 @@ class PiBridge:
 # App
 # --------------------------------------------------------------------------- #
 
-# Speaker is referenced by PiBridge; instantiate after definition.
-speaker: Speaker  # set in main
-
-
-def banner(mic_index: str, model: Path, say_voice: str | None, speak_on: bool):
-    print(c("cyan", "╭─ pivoice ────────────────────────────────────────────"))
-    print(c("cyan", "│") + f"  mic      : avfoundation :{mic_index}")
-    print(c("cyan", "│") + f"  stt      : whisper.cpp  {model.name}")
-    print(c("cyan", "│") + f"  tts      : say"
-          + (f"  voice={say_voice}" if say_voice else "")
-          + ("  (muted)" if not speak_on else ""))
-    print(c("cyan", "│"))
-    print(c("cyan", "│") + "  " + c("bold", "SPACE/r") + " talk   "
-          + c("bold", "a") + " abort   " + c("bold", "n") + " new   "
-          + c("bold", "c") + " clear   " + c("bold", "q") + " quit")
-    print(c("cyan", "╰─────────────────────────────────────────────────────"))
+speaker: Speaker   # referenced by PiBridge._feed_tts; set in main()
 
 
 def main():
     global speaker
+
     model = Path(os.environ.get("PIVOICE_MODEL", DEFAULT_MODEL)).expanduser()
     if not model.exists():
-        print(c("red", f"[!] Whisper model not found: {model}"))
-        print("    Download from https://huggingface.co/ggerganov/whisper.cpp")
-        print("    e.g. curl -L -o models/ggml-small.en.bin \\")
-        print("      https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en.bin")
+        sys.stdout.write(c("red", f"[!] Whisper model not found: {model}\n"))
+        sys.stdout.write("    Download from https://huggingface.co/ggerganov/whisper.cpp\n")
         sys.exit(1)
 
     mic_index = discover_mic()
@@ -476,86 +734,107 @@ def main():
     speaker = Speaker(say_voice if speak_on else None)
 
     cwd = os.environ.get("PIVOICE_PI_CWD") or os.getcwd()
-    extra_args = os.environ.get("PIVOICE_PI_ARGS", "").split()
+    extra_args = [a for a in os.environ.get("PIVOICE_PI_ARGS", "").split() if a]
+
+    tts_label = ("say" + (f"/{say_voice}" if say_voice else "")
+                 + (" (muted)" if not speak_on else ""))
+    info = {"mic": f":{mic_index}", "stt": model.name, "tts": tts_label, "cwd": cwd}
+
+    tui = TUI(info)
 
     def on_text(delta):
-        sys.stdout.write(delta)
-        sys.stdout.flush()
+        tui.stream(delta)
 
-    print(c("grey", f"starting pi (cwd={cwd}) …"))
-    bridge = PiBridge(on_text=on_text, on_event=lambda e: None,
-                      cwd=cwd, extra_args=extra_args)
+    def on_state(state):
+        detail = {"thinking": "waiting on model…",
+                  "speaking": "streaming reply…",
+                  "recording": "listening — tap SPACE to send",
+                  "transcribing": "whisper.cpp decoding…"}.get(state, "")
+        tui.set_state(state, detail)
+
+    def on_turn_end():
+        tui.commit_stream()
+
+    def on_event(ev):
+        kind, payload = ev
+        if kind == "extension_error":
+            tui.add(f"[pi extension] {payload}", "warn")
+
+    # Boot pi before entering the alt screen, so boot errors print normally.
+    sys.stdout.write(c("grey", f"starting pi (cwd={cwd}) …\n"))
+    sys.stdout.flush()
+    bridge = PiBridge(cwd=cwd, extra_args=extra_args, on_text=on_text,
+                      on_state=on_state, on_turn_end=on_turn_end,
+                      on_event=on_event)
     try:
         bridge.start()
     except Exception as e:
-        print(c("red", f"[!] failed to start pi: {e}"))
+        sys.stdout.write(c("red", f"[!] failed to start pi: {e}\n"))
         sys.exit(1)
     time.sleep(0.6)
     if bridge.proc.poll() is not None:
         log = (HERE / "pi.log").read_text(errors="ignore").strip()
-        print(c("red", f"[!] pi exited immediately."))
+        sys.stdout.write(c("red", "[!] pi exited immediately.\n"))
         if log:
-            print(c("grey", log[-1000:]))
-        print(c("grey", "  check `pi` works on its own, or set PIVOICE_PI_ARGS."))
+            sys.stdout.write(c("grey", log[-800:] + "\n"))
         sys.exit(1)
 
     recorder = Recorder(mic_index)
-    wav_path = HERE / "last.wav"  # always overwritten; symlink-like convenience
+    wav_path = HERE / "last.wav"
 
-    def redraw():
-        print()
-        banner(mic_index, model, say_voice, speak_on)
+    # ---- enter the TUI ---------------------------------------------------- #
+    with RawTerm():
+        tui.setup()
+        tui.add("ready · tap SPACE to talk", "ok")
 
-    redraw()
+        # ensure teardown even on signals
+        def _on_sig(signum, frame):
+            raise KeyboardInterrupt
+        for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT):
+            signal.signal(s, _on_sig)
 
-    state = "idle"  # idle | recording
-    rec_start_ts = 0.0
-    REARM_GAP = 0.15        # held keys repeat ~30ms; a real re-press has a wider gap
-    last_key = ""
-    last_key_ts = 0.0
-    with RawTerm() as term:
+        state = "idle"
+        rec_start_ts = 0.0
+        REARM_GAP = 0.15
+        last_key, last_key_ts = "", 0.0
         try:
             while True:
-                key = term.getkey().lower()
-                # Suppress held-key repeats: a held key auto-repeats ~30ms,
-                # but a genuine re-press has a wider gap. Per-key re-arm.
+                key = term_getkey().lower()
                 now = time.time()
                 if key == last_key and now - last_key_ts < REARM_GAP:
                     last_key_ts = now
                     continue
-                last_key = key
-                last_key_ts = now
-                # Abort / stop talking always available
-                if key in ("a",):
+                last_key, last_key_ts = key, now
+
+                if key == "a":
                     speaker.stop()
                     if bridge.streaming:
                         bridge.abort()
-                        print(c("yellow", "\n[aborted]"))
+                        tui.add("aborted", "warn")
                     continue
-                if key in ("q",):
+                if key == "q":
                     break
-                if key in ("c",):
-                    print("\033[2J\033[H", end="")
-                    redraw()
+                if key == "c":
+                    tui.clear_log()
+                    tui.add("cleared", "sys")
                     continue
-                if key in ("n",):
+                if key == "n":
                     speaker.stop()
                     bridge.new_session()
-                    print(c("green", "\n[new session]"))
+                    tui.add("new session", "ok")
                     continue
 
-                # Push-to-talk (held-key repeats suppressed above)
                 if key in (" ", "r"):
                     if state == "idle":
                         speaker.stop()
-                        print()
-                        sys.stdout.write(c("magenta", "● REC ") + c("grey", "(press again to send) "))
-                        sys.stdout.flush()
+                        tui.set_state("recording", "listening — tap SPACE to send")
                         try:
                             recorder.start(wav_path)
                         except Exception as e:
-                            print(c("red", f"\n[recording error] {e}"))
-                            print(c("grey", "  check mic index / permission (System Settings → Privacy → Microphone)"))
+                            tui.add(f"recording error: {e}", "err")
+                            tui.add("check mic index / System Settings → Privacy → Microphone",
+                                    "sys")
+                            tui.set_state("idle")
                             continue
                         rec_start_ts = time.time()
                         state = "recording"
@@ -564,37 +843,51 @@ def main():
                             rec_path = recorder.stop()
                         except Exception as e:
                             state = "idle"
-                            print(c("red", f"\n[recording error] {e}"))
+                            tui.set_state("idle")
+                            tui.add(f"recording error: {e}", "err")
                             continue
                         state = "idle"
                         if time.time() - rec_start_ts < 0.4:
-                            print(c("grey", "\n(too short — hold a little longer)"))
+                            tui.add("too short — hold a little longer", "sys")
                             continue
-                        print("\r" + " " * 50 + "\r", end="")
-                        sys.stdout.write(c("grey", "transcribing… "))
-                        sys.stdout.flush()
+                        tui.set_state("transcribing", "whisper.cpp decoding…")
                         if not rec_path.exists() or rec_path.stat().st_size < 44:
-                            print(c("grey", "(no audio captured — press and hold a moment)"))
+                            tui.set_state("idle")
+                            tui.add("no audio captured — try again", "sys")
                             continue
                         t0 = time.time()
                         try:
                             text = transcribe(model, rec_path)
                         except Exception as e:
-                            print(c("red", f"\n[stt error] {e}"))
+                            tui.set_state("idle")
+                            tui.add(f"stt error: {e}", "err")
                             continue
                         dt = time.time() - t0
                         if not text:
-                            print(c("grey", "(nothing heard)"))
+                            tui.set_state("idle")
+                            tui.add("(nothing heard)", "sys")
                             continue
-                        print(c("green", f"{text}") + c("grey", f"  [{dt:.1f}s]"))
-                        print(c("blue", "pi » ") + c("grey", "(thinking…) "), end="", flush=True)
+                        tui.add(f"▸ {text}   {dt:.1f}s", "user")
+                        tui.set_state("thinking", "waiting on model…")
                         bridge.prompt(text)
         except KeyboardInterrupt:
             pass
+        finally:
+            tui.teardown()
 
-    print(c("grey", "\nshutting down…"))
+    sys.stdout.write(c("grey", "shutting down…\n"))
     speaker.shutdown()
     bridge.shutdown()
+
+
+def term_getkey() -> str:
+    """Read one key from the (already-raw) terminal."""
+    ch = sys.stdin.read(1)
+    if ch == "\x03":
+        raise KeyboardInterrupt
+    if ch == "\r":
+        ch = "\n"
+    return ch
 
 
 if __name__ == "__main__":
