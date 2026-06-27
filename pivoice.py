@@ -521,7 +521,30 @@ class Recorder:
         self.path = None
         self.stderr = ""
 
+    def cleanup(self):
+        """Force-kill any live ffmpeg. Safe to call multiple times.
+
+        Registered with atexit + signal paths so a crash or kill mid-recording
+        can't orphan ffmpeg holding the mic (which is what wedged pivoice
+        historically: stacked avfoundation processes)."""
+        proc = self.proc
+        self.proc = None
+        if proc is not None and proc.poll() is None:
+            for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGKILL):
+                try:
+                    proc.send_signal(sig)
+                except Exception:
+                    pass
+                try:
+                    proc.wait(timeout=2)
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+
     def start(self, path: Path):
+        # Defensive: never stack a second ffmpeg on top of a live one.
+        if self.proc is not None and self.proc.poll() is None:
+            self.cleanup()
         self.path = path
         if path.exists():
             path.unlink()
@@ -906,6 +929,7 @@ def main():
         sys.exit(1)
 
     recorder = Recorder(mic_index)
+    atexit.register(recorder.cleanup)   # never orphan ffmpeg, even on a hard crash
     wav_path = HERE / "last.wav"
 
     # ---- enter the TUI ---------------------------------------------------- #
@@ -999,6 +1023,7 @@ def main():
         except KeyboardInterrupt:
             pass
         finally:
+            recorder.cleanup()   # kill any in-flight recording before leaving the TUI
             tui.teardown()
 
     sys.stdout.write(c("grey", "shutting down…\n"))
